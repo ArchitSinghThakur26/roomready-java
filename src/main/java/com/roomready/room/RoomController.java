@@ -33,7 +33,12 @@ public class RoomController {
         return rooms.room(property , no);
     }
 
-        @GetMapping("/housekeepers")
+    @GetMapping("/rooms/{no}/history")
+    public HistoryView history(@PathVariable String property, @PathVariable String no,
+                               @RequestParam(required = false) String stay) {
+        return rooms.history(property, no, stay);
+    }
+
     public HousekeepersView  housekeepers(@PathVariable String property ) {
         return rooms.housekeepers(property);
     }

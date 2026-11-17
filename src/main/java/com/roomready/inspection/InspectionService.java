@@ -4,14 +4,17 @@ import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
-
+import java.util.LinkedHashMap;
+import java.util.Map;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import com.roomready.assignment.AssignmentRepository;
 import com.roomready.error.NoSuchHousekeeper;
 import com.roomready.error.SelfInspection;
 import com.roomready.error.StepSkipped;
+import com.roomready.room.EventLog;
 import com.roomready.room.HousekeeperRepository;
+import com.roomready.room.EventLog;
 import com.roomready.room.PropertyRepository;
 import com.roomready.room.RoomService;
 import com.roomready.room.RoomState;
@@ -32,11 +35,12 @@ public class InspectionService {
     private final InspectionRepository inspections;
     private final ReadinessRepository readiness;
     private final StayRepository stays;
+    private final EventLog events;
     private final Clock clock;  
 
     public InspectionService(PropertyRepository properties, RoomService rooms, HousekeeperRepository housekeepers,
                         AssignmentRepository assignments, InspectionRepository inspections,
-                        ReadinessRepository readiness,StayRepository stays,Clock clock) {
+                        ReadinessRepository readiness,StayRepository stays, EventLog events,Clock clock) {
         this.properties = properties;
         this.rooms = rooms;
         this.housekeepers = housekeepers; 
@@ -44,12 +48,14 @@ public class InspectionService {
         this.inspections = inspections;
         this.readiness = readiness;
         this.stays = stays;
+        this.events = events;
         this.clock = clock;
     }
 
     /** 
     * Checks in order: the room exists, it is waiting for inspection, the inspector exists, and did not clean it. The Line 3: inspection row and, on a pass, the readiness stamp are one transaction: one failure undoes both.
-    *  inspection row and, on a pass, the readiness stamp are one transaction: one failure undoes both. 
+    *  inspection row, on a pass the readiness stamp, and the `inspected` event are one transaction: one failure undoes
+    * them all.
     */
     @Transactional
     public InspectionResponse inspect(String property, String room, String inspector, Result result) {
@@ -64,16 +70,29 @@ public class InspectionService {
         if (clean.housekeeperId().equals(who.id())) {
             throw new SelfInspection(room, clean.cleanedBy());
         }
+        boolean pass = result == Result.pass;
         Instant now= clock.instant().truncatedTo(ChronoUnit.SECONDS);
         long id = inspections.insert(propertyId, room, clean.id(), who.id(), result,now);
-                if (result == Result.fail) {
-            return new InspectionResponse(InspectionIds.format(id), room, clean.cleanedBy(), who.name(), result,
-                    rooms.room(property, room).state(), null, null, null);
+        StayRepository.Row stay = stays.current(propertyId, room).orElseThrow();
+        Map<String, Object> facts = new LinkedHashMap<>(Map.of("inspector", who.id(), "result", result.name()));
+        Integer margin = pass ? ready(propertyId, room, now, stay.arrivalAt(), facts) : null;
+        events.append(propertyId, room, stay.id(), clean.id(), "inspected", now, who.id(), facts);
+                return new InspectionResponse(InspectionIds.format(id), room, clean.cleanedBy(), who.name(), result,
+                rooms.room(property, room).state(), pass ? now : null, pass ? stay.arrivalAt() : null, margin);
+    }
+    
+    /**
+     * A pass stamps the room's readiness - when, the next guest's arrival, the margin between (null when no
+     * arrival is known) - and adds the margin and the arrival to the event's facts.
+     */
+    private Integer ready(long propertyId, String room, Instant now, Instant arrivalAt, Map<String, Object> facts) {
+        Integer margin = arrivalAt == null ? null :
+        (int) Duration.between(now, arrivalAt).toMinutes(); 
+        readiness.insert(propertyId, room, now, arrivalAt, margin);
+                if (arrivalAt != null) {
+            facts.put("marginMinutes", margin);
+            facts.put("arrivalAt", arrivalAt.toString());
         }
-                Instant arrivalAt = stays.current(propertyId, room).orElseThrow().arrivalAt();
-        Integer margin = arrivalAt == null ? null : (int) Duration.between(now, arrivalAt).toMinutes();
-                readiness.insert(propertyId, room, now, arrivalAt, margin);
-        return new InspectionResponse(InspectionIds.format(id), room, clean.cleanedBy(), who.name(), result,
-                rooms.room(property, room).state(), now, arrivalAt, margin);
+        return margin;
     }
 }
